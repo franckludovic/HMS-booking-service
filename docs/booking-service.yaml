@@ -1,0 +1,411 @@
+openapi: 3.0.3
+
+info:
+  title: Home Services Marketplace - Booking Service API
+  version: 1.0.0
+  description: |
+    Booking Service API for the Home Services Marketplace ap.
+    Manages booking creation, lifecycle transitions, scheduling coordination,
+    cancellations.
+
+servers:
+  - url: http://localhost:3004/booking 
+    description: Local development environment
+
+  - url: https://staging.api.marketplace.com/booking
+    description: Staging environment
+
+  - url: https://api.marketplace.com/booking
+    description: Production API Gateway route
+
+
+tags:
+  - name: Bookings
+    description: Booking lifecycle and management operations
+
+paths:
+
+  /bookings:
+    get:
+      summary: List bookings
+      tags: [Bookings]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/offset'
+        - name: role
+          in: query
+          schema:
+            type: string
+            enum: [client, worker]
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum:
+              - requested
+              - pending_approval
+              - accepted
+              - in_progress
+              - completed
+              - cancelled_by_client
+              - cancelled_by_worker
+      responses:
+        '200':
+          description: Bookings retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingList'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    post:
+      summary: Create a new booking
+      description: |
+        Initiates a new booking between a client and a worker.
+        Validates worker availability before creation.
+        Initial state = requested.
+      tags: [Bookings]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookingRequest'
+      responses:
+        '201':
+          description: Booking successfully created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Booking conflict (worker unavailable or overlapping schedule)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /bookings/validate:
+    post:
+      summary: Validate worker availability
+      description: |
+        Checks if a worker is available for a given time slot.
+      tags: [Bookings]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workerId, scheduledAt, durationMinutes]
+              properties:
+                workerId:
+                  type: string
+                  format: uuid
+                scheduledAt:
+                  type: string
+                  format: date-time
+                durationMinutes:
+                  type: integer
+      responses:
+        '200':
+          description: Availability result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available:
+                    type: boolean
+                  reason:
+                    type: string
+        '409':
+          description: Worker unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /bookings/{bookingId}:
+    get:
+      summary: Get booking details
+      tags: [Bookings]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/bookingId'
+      responses:
+        '200':
+          description: Booking retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /bookings/{bookingId}/status:
+    patch:
+      summary: Update booking lifecycle status
+      description: |
+        Performs controlled lifecycle transitions.
+        Allowed transitions:
+        - requested => pending_approval
+        - pending_approval => accepted
+        - accepted => in_progress
+        - in_progress => completed
+        - requested => cancelled_by_client
+        - pending_approval => cancelled_by_client
+        - accepted => cancelled_by_worker
+        - in_progress => cancelled_by_worker
+      tags: [Bookings]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/bookingId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateBookingStatusRequest'
+      responses:
+        '200':
+          description: Booking status updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          description: Invalid lifecycle transition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Caller not authorized to perform transition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /bookings/events:
+    get:
+      summary: List booking domain events
+      description: |
+        Returns booking-related domain events for integration with other services.
+        Events include: BookingRequested, BookingAccepted, BookingCancelled, BookingCompleted.
+      tags: [Bookings]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Event stream
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    eventType:
+                      type: string
+                    bookingId:
+                      type: string
+                      format: uuid
+                    timestamp:
+                      type: string
+                      format: date-time
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    bookingId:
+      name: bookingId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+    offset:
+      name: offset
+      in: query
+      schema:
+        type: integer
+        minimum: 0
+
+  responses:
+    BadRequest:
+      description: Invalid request format or parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UnauthorizedError:
+      description: Authentication required or invalid token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Booking not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ValidationError:
+      description: Input validation failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalServerError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+
+    Booking:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        clientId:
+          type: string
+          format: uuid
+        workerId:
+          type: string
+          format: uuid
+        serviceCategory:
+          type: string
+        serviceType:
+          type: string
+        location:
+          type: string
+        scheduledAt:
+          type: string
+          format: date-time
+        durationMinutes:
+          type: integer
+        status:
+          type: string
+          enum:
+            - requested
+            - pending_approval
+            - accepted
+            - in_progress
+            - completed
+            - cancelled_by_client
+            - cancelled_by_worker
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    BookingList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Booking'
+        total:
+          type: integer
+          description: Total number of bookings available for pagination
+
+    CreateBookingRequest:
+      type: object
+      required:
+        - clientId
+        - workerId
+        - scheduledAt
+        - durationMinutes
+      properties:
+        clientId:
+          type: string
+          format: uuid
+        workerId:
+          type: string
+          format: uuid
+        scheduledAt:
+          type: string
+          format: date-time
+        durationMinutes:
+          type: integer
+        notes:
+          type: string
+        serviceType:
+          type: string
+        location:
+          type: string
+
+    UpdateBookingStatusRequest:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - pending_approval
+            - accepted
+            - in_progress
+            - completed
+            - cancelled_by_client
+            - cancelled_by_worker
+        cancellationReason:
+          type: string
+          description: Optional reason provided when a booking is cancelled
+
+    Error:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Domain-specific error code (e.g., BKG_SLOT_UNAVAILABLE)
+        message:
+          type: string
+        details:
+          type: object

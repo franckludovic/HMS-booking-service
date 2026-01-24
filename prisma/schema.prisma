@@ -1,0 +1,80 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+
+enum BookingStatus {
+  requested
+  pending_approval
+  accepted
+  in_progress
+  completed
+  cancelled_by_client
+  cancelled_by_worker
+}
+
+enum EventType {
+  BookingRequested
+  BookingPendingApproval
+  BookingAccepted
+  BookingInProgress
+  BookingCompleted
+  BookingCancelledByClient
+  BookingCancelledByWorker
+}
+
+model Booking {
+  id        String        @id @default(uuid())
+
+  // External references (microservice-safe)
+  clientId  String        // user-service
+  workerId  String        // worker-profile-service
+
+  // Booking details
+  serviceCategory String?
+  serviceType     String?
+  location        String?
+
+  scheduledAt     DateTime
+  durationMinutes Int
+
+  status          BookingStatus @default(requested)
+
+  notes               String?
+  cancellationReason  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  events BookingEvent[]
+
+  @@index([clientId])
+  @@index([workerId])
+  @@index([status])
+  @@index([scheduledAt])
+  @@map("bookings")
+}
+
+model BookingEvent {
+  id        String    @id @default(uuid())
+  eventType EventType
+  bookingId String
+  booking   Booking   @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  timestamp DateTime  @default(now())
+
+  @@index([bookingId])
+  @@index([timestamp])
+  @@map("booking_events")
+}
