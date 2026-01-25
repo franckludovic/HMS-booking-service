@@ -2,6 +2,7 @@ const { PrismaClient } = require('@prisma/client');
 const { calculateEndTime, checkOverlap } = require('../utils/time');
 const { isTransitionAllowed } = require('../utils/lifecycle');
 const redisClient = require('../config/redis');
+const axios = require('axios');
 
 const prisma = new PrismaClient();
 
@@ -57,6 +58,26 @@ const createBooking = async (bookingData) => {
       bookingId: booking.id,
     },
   });
+
+  // Emit domain event
+  try {
+    await axios.post('http://localhost:3000/internal/events', {
+      eventType: 'booking.created',
+      timestamp: new Date().toISOString(),
+      data: {
+        bookingId: booking.id,
+        clientId,
+        workerId,
+        scheduledAt,
+        serviceCategory: serviceType, // Assuming serviceType maps to category
+        serviceType,
+        durationMinutes
+      }
+    });
+  } catch (error) {
+    console.error('Failed to emit booking.created event:', error.message);
+    // Don't fail the booking creation if event emission fails
+  }
 
   return booking;
 };
