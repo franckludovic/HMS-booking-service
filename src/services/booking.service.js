@@ -1,167 +1,254 @@
-const { PrismaClient } = require('@prisma/client');
-const { calculateEndTime, checkOverlap } = require('../utils/time');
-const { isTransitionAllowed } = require('../utils/lifecycle');
-const redisClient = require('../config/redis');
+const prisma = require('../database/prismaClient');
+const RedisCache = require('../utils/redisCache');
+const RedisLock = require('../utils/redisLock');
+const { isValidTransition, canUserUpdateStatus } = require('../utils/lifecycle');
 const axios = require('axios');
+const config = require('../config/config');
+const redisClient = require('../config/redis');
 
-const prisma = new PrismaClient();
+const cache = new RedisCache(redisClient, 300);
+const lock = new RedisLock(redisClient);
 
-const getBookings = async (userId, { limit = 10, offset = 0, role, status }) => {
-  const where = {};
-  if (role === 'client') {
-    where.clientId = userId;
-  } else if (role === 'worker') {
-    where.workerId = userId;
-  }
-  if (status) {
-    where.status = status;
-  }
+class BookingService {
+  static async getBookings(userId, { limit = 10, offset = 0, role, status }) {
+    const cacheKey = `bookings:${userId}:${limit}:${offset}:${role}:${status}`;
 
-  const bookings = await prisma.booking.findMany({
-    where,
-    take: limit,
-    skip: offset,
-    orderBy: { createdAt: 'desc' },
-  });
+    // Try cache first
+    const cached = await cache.get(cacheKey);
+    if (cached) {
+      return JSON.parse(cached);
+    }
 
-  const total = await prisma.booking.count({ where });
+    // Build where clause
+    const where = {};
+    if (role === 'client') {
+      where.clientId = userId;
+    } else if (role === 'worker') {
+      where.workerId = userId;
+    } else {
+      // If no role specified, get all bookings where user is client or worker
+      where.OR = [
+        { clientId: userId },
+        { workerId: userId }
+      ];
+    }
 
-  return { items: bookings, total };
-};
+    if (status) {
+      where.status = status;
+    }
 
-const createBooking = async (bookingData) => {
-  const { clientId, workerId, scheduledAt, durationMinutes, serviceType, location, notes } = bookingData;
-
-  // Check for overlapping bookings
-  const endTime = calculateEndTime(scheduledAt, durationMinutes);
-  const overlap = await checkOverlap(workerId, scheduledAt, endTime);
-  if (overlap) {
-    throw new Error('Worker is not available at the requested time');
-  }
-
-  const booking = await prisma.booking.create({
-    data: {
-      clientId,
-      workerId,
-      scheduledAt,
-      durationMinutes,
-      serviceType,
-      location,
-      notes,
-    },
-  });
-
-  // Create event
-  await prisma.bookingEvent.create({
-    data: {
-      eventType: 'BookingRequested',
-      bookingId: booking.id,
-    },
-  });
-
-  // Emit domain event
-  try {
-    await axios.post('http://localhost:3000/internal/events', {
-      eventType: 'booking.created',
-      timestamp: new Date().toISOString(),
-      data: {
-        bookingId: booking.id,
-        clientId,
-        workerId,
-        scheduledAt,
-        serviceCategory: serviceType, // Assuming serviceType maps to category
-        serviceType,
-        durationMinutes
+    const bookings = await prisma.booking.findMany({
+      where,
+      take: parseInt(limit),
+      skip: parseInt(offset),
+      orderBy: { createdAt: 'desc' },
+      include: {
+        events: {
+          orderBy: { timestamp: 'desc' },
+          take: 5 // Last 5 events
+        }
       }
     });
-  } catch (error) {
-    console.error('Failed to emit booking.created event:', error.message);
-    // Don't fail the booking creation if event emission fails
+
+    // Cache the result
+    await cache.set(cacheKey, bookings);
+
+    return bookings;
   }
 
-  return booking;
-};
+  static async createBooking(bookingData, authHeader) {
+    const { clientId, workerId, slotId, scheduledAt, serviceType, location, notes } = bookingData;
 
-const validateBooking = async ({ workerId, scheduledAt, durationMinutes }) => {
-  const endTime = calculateEndTime(scheduledAt, durationMinutes);
-  const overlap = await checkOverlap(workerId, scheduledAt, endTime);
-  return { available: !overlap, reason: overlap ? 'Worker unavailable' : null };
-};
+    // Use distributed lock to prevent race conditions
+    const lockKey = `booking:slot:${slotId}`;
+    const lockAcquired = await lock.acquire(lockKey, 30000); // 30 seconds
 
-const getBooking = async (bookingId) => {
-  return await prisma.booking.findUnique({
-    where: { id: bookingId },
-  });
-};
+    if (!lockAcquired) {
+      throw new Error('Unable to process booking due to high demand. Please try again.');
+    }
 
-const updateBookingStatus = async (bookingId, { status, cancellationReason }, user) => {
-  const booking = await prisma.booking.findUnique({ where: { id: bookingId } });
-  if (!booking) {
-    throw new Error('Booking not found');
+    try {
+      // Check if worker offers the service
+      const workerResponse = await axios.get(`${config.workerProfileServiceUrl}/profile/workers/${workerId}`, {
+        headers: { authorization: authHeader }
+      });
+      const worker = workerResponse.data;
+
+      // Check if worker has the service in their categories
+      const hasService = worker.categories?.some(cat => cat.category.name.toLowerCase() === serviceType.toLowerCase());
+      if (!hasService) {
+        throw new Error('Worker does not offer this service');
+      }
+
+      // Get slot details to validate scheduledAt is within slot time range
+      const slotDetailsResponse = await axios.get(`${config.availabilityServiceUrl}/availability/slots/${slotId}`, {
+        headers: { authorization: authHeader }
+      });
+      const slot = slotDetailsResponse.data;
+
+      // Validate scheduledAt falls within slot's time range
+      const scheduledTime = new Date(scheduledAt);
+      const slotStart = new Date(slot.startTime);
+      const slotEnd = new Date(slot.endTime);
+
+      if (scheduledTime < slotStart || scheduledTime >= slotEnd) {
+        throw new Error('Scheduled time must fall within the selected slot\'s time range');
+      }
+
+      // Reserve the slot
+      await axios.post(`${config.availabilityServiceUrl}/availability/slots/${slotId}/reserve`, {}, {
+        headers: { authorization: authHeader }
+      });
+
+      let booking;
+      try {
+        // Create booking
+        booking = await prisma.booking.create({
+          data: {
+            clientId,
+            workerId,
+            slotId,
+            scheduledAt: new Date(scheduledAt),
+            serviceType,
+            location,
+            notes,
+            status: 'requested'
+          }
+        });
+
+        // Create initial event
+        await prisma.bookingEvent.create({
+          data: {
+            eventType: 'BookingRequested',
+            bookingId: booking.id
+          }
+        });
+
+        return booking;
+      } catch (error) {
+        // If booking creation fails, release the slot
+        try {
+          await axios.post(`${config.availabilityServiceUrl}/availability/slots/${slotId}/release`, {}, {
+            headers: { authorization: authHeader }
+          });
+        } catch (releaseError) {
+          console.error('Failed to release slot after booking error:', releaseError.message);
+        }
+        throw error; // Re-throw the original error
+      }
+    } finally {
+      // Always release the lock
+      await lock.release(lockKey);
+    }
   }
 
-  if (!isTransitionAllowed(booking.status, status)) {
-    throw new Error('Invalid status transition');
+  static async validateBooking({ workerId, scheduledAt }, authHeader) {
+    try {
+      // Convert scheduledAt to start and calculate end 
+      const start = new Date(scheduledAt);
+      const end = new Date(start.getTime() + 60 * 60 * 1000); // Add 1 hour
+
+      const response = await axios.post(`${config.availabilityServiceUrl}/availability/validate`, {
+        workerId,
+        start: start.toISOString(),
+        end: end.toISOString()
+      }, {
+        headers: { authorization: authHeader }
+      });
+
+      return response.data;
+    } catch (error) {
+    
+      if (error.response) {
+        // Server responded with error status
+        const message = error.response.data?.message || error.response.data?.error || error.response.statusText;
+        throw new Error('Validation failed: ' + message);
+      } else if (error.request) {
+        // Request was made but no response received
+        throw new Error('Validation failed: No response from availability service');
+      } else {
+        // Something else happened
+        throw new Error('Validation failed: ' + error.message);
+      }
+    }
   }
 
-  // Authorization check
-  if (status === 'cancelled_by_client' && booking.clientId !== user.id) {
-    throw new Error('Unauthorized');
+  static async getBooking(bookingId) {
+    const booking = await prisma.booking.findUnique({
+      where: { id: bookingId },
+      include: {
+        events: {
+          orderBy: { timestamp: 'desc' }
+        }
+      }
+    });
+
+    if (!booking) {
+      throw new Error('Booking not found');
+    }
+
+    return booking;
   }
-  if (status === 'cancelled_by_worker' && booking.workerId !== user.id) {
-    throw new Error('Unauthorized');
+
+  static async updateBookingStatus(bookingId, { status, cancellationReason }, user) {
+    const booking = await prisma.booking.findUnique({
+      where: { id: bookingId }
+    });
+
+    if (!booking) {
+      throw new Error('Booking not found');
+    }
+
+    // Check ownership
+    if (booking.clientId !== user.sub && booking.workerId !== user.sub) {
+      throw new Error('Unauthorized to update this booking');
+    }
+
+    // Validate transition
+    if (!isValidTransition(booking.status, status)) {
+      throw new Error(`Invalid status transition from ${booking.status} to ${status}`);
+    }
+
+    // Check user permissions
+    if (!canUserUpdateStatus(user.role, booking.status, status)) {
+      throw new Error('User not authorized for this status change');
+    }
+
+    // Update booking
+    const updatedBooking = await prisma.booking.update({
+      where: { id: bookingId },
+      data: {
+        status,
+        cancellationReason: status.startsWith('cancelled') ? cancellationReason : null
+      }
+    });
+
+    // Create event
+    const eventType = `Booking${status.charAt(0).toUpperCase() + status.slice(1).replace('_', '')}`;
+    await prisma.bookingEvent.create({
+      data: {
+        eventType,
+        bookingId
+      }
+    });
+
+    // Invalidate cache
+    await cache.clearPattern(`bookings:*`);
+
+    updatedBooking.oldStatus = booking.status;
+
+    return updatedBooking;
   }
 
-  const updatedBooking = await prisma.booking.update({
-    where: { id: bookingId },
-    data: { status, cancellationReason },
-  });
+  static async getBookingEvents() {
 
-  // Create event
-  let eventType;
-  switch (status) {
-    case 'pending_approval':
-      eventType = 'BookingPendingApproval';
-      break;
-    case 'accepted':
-      eventType = 'BookingAccepted';
-      break;
-    case 'in_progress':
-      eventType = 'BookingInProgress';
-      break;
-    case 'completed':
-      eventType = 'BookingCompleted';
-      break;
-    case 'cancelled_by_client':
-      eventType = 'BookingCancelledByClient';
-      break;
-    case 'cancelled_by_worker':
-      eventType = 'BookingCancelledByWorker';
-      break;
-    default:
-      eventType = 'BookingRequested'; // fallback
+    const events = await prisma.bookingEvent.findMany({
+      orderBy: { timestamp: 'desc' },
+      take: 100 // Limit for audit
+    });
+
+    return events;
   }
-  await prisma.bookingEvent.create({
-    data: {
-      eventType,
-      bookingId,
-    },
-  });
+}
 
-  return updatedBooking;
-};
-
-const getBookingEvents = async () => {
-  return await prisma.bookingEvent.findMany({
-    orderBy: { timestamp: 'desc' },
-  });
-};
-
-module.exports = {
-  getBookings,
-  createBooking,
-  validateBooking,
-  getBooking,
-  updateBookingStatus,
-  getBookingEvents,
-};
+module.exports = BookingService;

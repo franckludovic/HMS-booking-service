@@ -1,11 +1,15 @@
 require('dotenv').config();
 
-module.exports = {
+const config = {
   port: process.env.PORT || 3004,
-  databaseUrl: process.env.DATABASE_URL,
-  redisUrl: process.env.REDIS_URL,
   jwtPublicKeyPath: process.env.JWT_PUBLIC_KEY_PATH,
   jwtIssuer: process.env.JWT_ISSUER,
   jwtAudience: process.env.JWT_AUDIENCE,
-  jwtExpiresIn: process.env.JWT_EXPIRES_IN,
+  databaseUrl: process.env.DATABASE_URL,
+  redisUrl: process.env.REDIS_URL,
+  eventBusRedisUrl: process.env.EVENT_BUS_REDIS_URL,
+  availabilityServiceUrl: process.env.AVAILABILITY_SERVICE_URL,
+  workerProfileServiceUrl: process.env.WORKER_PROFILE_SERVICE_URL
 };
+
+module.exports = config;

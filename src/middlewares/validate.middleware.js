@@ -1,20 +1,11 @@
-function validateRequest(schema, property = 'body') {
+const validateRequest = (schema) => {
   return (req, res, next) => {
-    console.log('Validating request body:', req[property]);
-    const { error } = schema.validate(req[property], { abortEarly: false });
-
+    const { error } = schema.validate(req.body);
     if (error) {
-      const messages = error.details.map(d => d.message);
-      console.log('Validation errors:', messages);
-      return res.status(400).json({
-        success: false,
-        message: 'Validation error',
-        errors: messages,
-      });
+      return res.status(422).json({ error: error.details[0].message });
     }
-
     next();
   };
-}
+};
 
-module.exports = validateRequest;
+module.exports = { validateRequest };

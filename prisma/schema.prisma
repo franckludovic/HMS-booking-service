@@ -9,6 +9,7 @@ generator client {
   provider = "prisma-client-js"
 }
 
+
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
@@ -41,6 +42,7 @@ model Booking {
   // External references (microservice-safe)
   clientId  String        // user-service
   workerId  String        // worker-profile-service
+  slotId    String        // availability-service
 
   // Booking details
   serviceCategory String?
@@ -48,7 +50,6 @@ model Booking {
   location        String?
 
   scheduledAt     DateTime
-  durationMinutes Int
 
   status          BookingStatus @default(requested)
 
@@ -62,6 +63,7 @@ model Booking {
 
   @@index([clientId])
   @@index([workerId])
+  @@index([slotId])
   @@index([status])
   @@index([scheduledAt])
   @@map("bookings")

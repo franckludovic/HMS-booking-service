@@ -1,21 +1,42 @@
-version: '3.8'
+
 
 services:
-  db:
-    image: postgres:15
+  booking-db:
+    image: postgres:15-alpine
+    container_name: booking_service_db
     environment:
       POSTGRES_DB: booking_service_db
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: "1234567"
     ports:
-      - "5433:5432"
+      - "5435:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-  redis:
-    image: redis:7-alpine
+  booking-service:
+    build: .
+    container_name: booking_service_app
+    restart: always
     ports:
-      - "6380:6379"
+      - '3004:3004'
+    environment:
+      PORT: 3004
+      DATABASE_URL: postgresql://postgres:1234567@booking-db:5432/booking_service_db?schema=public
+      REDIS_EVENT_URL: redis://host.docker.internal:6384
+      REDIS_CACHE_URL: redis://host.docker.internal:6379
+      JWT_PUBLIC_KEY_PATH: /app/keys/jwt-public.pem
+      JWT_ISSUER: user-service
+      WORKER_PROFILE_SERVICE_URL: http://host.docker.internal:3002
+      AVAILABILITY_SERVICE_URL: http://host.docker.internal:3003
+      JWT_AUDIENCE: hms-service-clients
+    depends_on:
+      - booking-db
+    volumes:
+      - ./keys:/app/keys:ro
 
 volumes:
   postgres_data:
+
+networks:
+  hms-network:
+    external: true
